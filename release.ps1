@@ -10,10 +10,12 @@ $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
 
 Set-Content VERSION $Version -Encoding ascii
-& "$env:SystemRoot\System32\cmd.exe" /c windows\build.bat
+# Native tools write progress to stderr; under 'Stop', Windows PowerShell 5.1 would treat that as a failure
+# when the output is redirected. Exit codes are checked instead.
+& "$env:SystemRoot\System32\cmd.exe" /c "windows\build.bat 2>&1"
 if ($LASTEXITCODE) { throw 'Windows build failed' }
 Push-Location android
-& .\gradlew.bat assembleRelease --console=plain -q
+& "$env:SystemRoot\System32\cmd.exe" /c ".\gradlew.bat assembleRelease --console=plain -q 2>&1"
 $rc = $LASTEXITCODE
 Pop-Location
 if ($rc) { throw 'Android build failed' }
