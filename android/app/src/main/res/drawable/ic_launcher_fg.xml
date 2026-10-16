@@ -1,0 +1,18 @@
+<!-- Open lens ring with a record light in the gap; master copy in icon/opencam.svg. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <path
+        android:pathData="M75.44,49.05 A22,22 0 1,1 58.95,32.56"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="7"
+        android:strokeLineCap="round" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M46,54a8,8 0 1,0 16,0a8,8 0 1,0 -16,0z" />
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M65.06,38.44a4.5,4.5 0 1,0 9,0a4.5,4.5 0 1,0 -9,0z" />
+</vector>

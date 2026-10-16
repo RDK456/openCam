@@ -1,0 +1,38 @@
+# openCam wire protocol
+
+Phone = server, PC = client. One PC at a time; a new connection replaces the old one.
+
+- TCP `47100` on the phone. Wired: PC runs `adb forward tcp:47100 tcp:47100` and connects to `127.0.0.1:47100`.
+- UDP `47101` broadcast from the phone every 1 s while no PC is connected: ASCII `OPENCAM1|<model>|<tcpPort>`.
+
+## Framing (TCP, both directions)
+
+```
+u8  type
+u32 length (big-endian)
+u8  payload[length]
+```
+
+| type | dir | payload |
+|------|-----|---------|
+| 1 CONFIG | phone→pc | H.264 SPS+PPS, Annex B |
+| 2 FRAME  | phone→pc | `u8 keyframe` + `i64 ptsUs (BE)` + H.264 access unit, Annex B |
+| 3 JSON   | both     | UTF-8 JSON object, field `t` = message kind |
+
+## JSON messages
+
+phone→pc
+- `{"t":"caps", ...}`: what the current camera supports (zoom range, ev range, iso/exp range, focusMax, apertures, modes `["1920x1080@60",..]`, wb, torch, stab, manual, portrait, facings).
+- `{"t":"state", ...}`: every setting plus `conn` (`usb`/`wifi`), `demand`, `cam` (camera open). Sent on every change; the phone is the source of truth.
+
+pc→phone
+- `{"t":"set","k":"<key>","v":<value>}`: change one setting. Keys match `state`.
+- `{"t":"demand","v":true|false}`: PC needs frames (a Windows app opened the camera, or the PC window is visible). The phone keeps the camera closed when nobody needs it.
+- `{"t":"key"}`: request a keyframe.
+
+## State keys
+
+`facing` back|front · `zoom` float · `mode` video|pro|portrait · `af` bool · `focus` diopters · `ev` int ·
+`iso` int · `exp` ns · `wb` auto|daylight|cloudy|incandescent|fluorescent · `aperture` float ·
+`torch` bool · `stab` bool · `res` "WxH" · `fps` int · `mbps` int (0 = auto) · `live` bool ·
+`mirror` bool · `rot180` bool (the last two are applied on the PC side).

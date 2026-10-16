@@ -1,0 +1,10 @@
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/.idea/
+android/.kotlin/
+windows/out/
+dist/
+.remember/
+.superpowers/

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="18 18 72 72" width="512" height="512">
+  <!-- openCam: an open lens ring ("o" for open) with a record light in the gap. Same geometry as the Android adaptive icon. -->
+  <rect x="18" y="18" width="72" height="72" rx="18" fill="#000000"/>
+  <path d="M75.44,49.05 A22,22 0 1,1 58.95,32.56" fill="none" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="54" cy="54" r="8" fill="#FFFFFF"/>
+  <circle cx="69.56" cy="38.44" r="4.5" fill="#FFFFFF"/>
+</svg>
