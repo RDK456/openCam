@@ -5,11 +5,13 @@ import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
+import android.content.res.ColorStateList
 import android.graphics.Color
 import android.graphics.Typeface
 import android.graphics.drawable.Drawable
 import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.LayerDrawable
+import android.graphics.drawable.RippleDrawable
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -24,6 +26,7 @@ import android.view.ViewGroup.LayoutParams.MATCH_PARENT
 import android.view.ViewGroup.LayoutParams.WRAP_CONTENT
 import android.view.WindowInsets
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.TextView
@@ -75,12 +78,13 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var surface: SurfaceView
     private lateinit var vf: FrameLayout
     private lateinit var hint: TextView
-    private lateinit var torch: TextView
+    private lateinit var torch: View
     private lateinit var afBtn: TextView
     private lateinit var stab: TextView
     private lateinit var rot: TextView
     private lateinit var evBtn: TextView
-    private lateinit var mirror: TextView
+    private lateinit var mirror: View
+    private lateinit var connCard: LinearLayout
     private lateinit var zoomRow: LinearLayout
     private lateinit var sliderBox: LinearLayout
     private lateinit var sliderLabel: TextView
@@ -190,6 +194,11 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
     private fun pill(color: Int) = GradientDrawable().apply { cornerRadius = dp(100).toFloat(); setColor(color) }
 
+    private fun round(color: Int, r: Int) = GradientDrawable().apply { cornerRadius = dp(r).toFloat(); setColor(color) }
+
+    /** Pressed feedback that never changes the view's bounds. */
+    private fun View.ripple() { foreground = RippleDrawable(ColorStateList.valueOf(0x33FFFFFF), null, pill(Color.WHITE)) }
+
     private fun chip(text: String, size: Float = 13f, click: () -> Unit) = TextView(this).apply {
         this.text = text
         textSize = size
@@ -197,15 +206,34 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         gravity = Gravity.CENTER
         setTextColor(Color.WHITE)
         setPadding(dp(12), dp(7), dp(12), dp(7))
+        minHeight = dp(36)
         setOnClickListener { click() }
+        ripple()
     }
 
     private fun icon(text: String, size: Float = 17f, click: () -> Unit) = chip(text, size, click).apply {
         setPadding(dp(10), dp(10), dp(10), dp(10))
+        minWidth = dp(48)
+        minHeight = dp(48)
     }
 
-    private fun TextView.mark(on: Boolean, supported: Boolean = true) {
-        setTextColor(if (on) ACCENT else Color.WHITE)
+    /** 48 dp touch target around a 22 dp vector icon. */
+    private fun iconBtn(res: Int, desc: String, click: () -> Unit) = ImageView(this).apply {
+        setImageResource(res)
+        imageTintList = ColorStateList.valueOf(Color.WHITE)
+        scaleType = ImageView.ScaleType.CENTER_INSIDE
+        setPadding(dp(13), dp(13), dp(13), dp(13))
+        minimumWidth = dp(48)
+        minimumHeight = dp(48)
+        contentDescription = desc
+        setOnClickListener { click() }
+        ripple()
+    }
+
+    private fun View.mark(on: Boolean, supported: Boolean = true) {
+        val c = if (on) ACCENT else Color.WHITE
+        if (this is TextView) setTextColor(c)
+        if (this is ImageView) imageTintList = ColorStateList.valueOf(c)
         background = if (on) pill(CHIP) else null
         alpha = if (supported) 1f else 0.3f
     }
@@ -228,15 +256,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
 
         // top bar: quick toggles + settings drawer
         val top = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(dp(8), dp(4), dp(8), dp(4)) }
-        torch = icon("ϟ") { toggle("torch", supported = caps.optBoolean("torch")) }
+        torch = iconBtn(R.drawable.ic_flash, "Torch") { toggle("torch", supported = caps.optBoolean("torch")) }
         afBtn = icon("AF", 14f) { toggle("af", def = true, supported = caps.optBoolean("af")) }
         stab = icon("EIS", 14f) { toggle("stab", supported = caps.optBoolean("stab")) }
         rot = icon("180°", 14f) { toggle("rot180") }
-        for (v in listOf(torch, afBtn, stab, rot)) top.addView(v, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        top.addView(icon("⌄", 18f) { showDrawer(drawer.visibility != View.VISIBLE) }.apply {
-            background = pill(0x33FFFFFF)
-            setPadding(dp(18), dp(4), dp(18), dp(4))
-        })
+        for (v in listOf(torch, afBtn, stab, rot)) {
+            val cell = FrameLayout(this)
+            cell.addView(v, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.CENTER))
+            top.addView(cell, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        }
+        top.addView(iconBtn(R.drawable.ic_settings, "Settings") { showDrawer(drawer.visibility != View.VISIBLE) })
         col.addView(top, MATCH_PARENT, WRAP_CONTENT)
 
         // viewfinder with the zoom bar floating on it
@@ -248,7 +277,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         vf.addView(hint, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.CENTER))
         val zbar = FrameLayout(this)
         evBtn = icon("±", 20f) { openSlider(evSpec()) }
-        mirror = icon("⇋", 20f) { toggle("mirror") }
+        mirror = iconBtn(R.drawable.ic_mirror, "Mirror") { toggle("mirror") }
         zoomRow = LinearLayout(this).apply {
             gravity = Gravity.CENTER
             background = pill(0x66000000)
@@ -259,6 +288,16 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         zbar.addView(mirror, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.END or Gravity.CENTER_VERTICAL))
         vf.addView(zbar, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.BOTTOM).apply {
             setMargins(dp(8), 0, dp(8), dp(12))
+        })
+        connCard = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            background = round(0xF21C1C1E.toInt(), 20)
+            setPadding(dp(20), dp(18), dp(20), dp(14))
+            isClickable = true
+            visibility = View.GONE
+        }
+        vf.addView(connCard, FrameLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT, Gravity.CENTER).apply {
+            setMargins(dp(16), dp(16), dp(16), dp(72))
         })
         vf.addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> vf.post { fitSurface() } }
         val scaler = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
@@ -302,7 +341,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         sliderBox.addView(sliderLabel)
         sliderBox.addView(bar, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
-        sliderBox.addView(icon("✕", 14f) { spec = null; sliderBox.visibility = View.GONE; render() })
+        sliderBox.addView(iconBtn(R.drawable.ic_close, "Close") { spec = null; sliderBox.visibility = View.GONE; render() })
         col.addView(sliderBox, MATCH_PARENT, WRAP_CONTENT)
 
         proRow = LinearLayout(this).apply { gravity = Gravity.CENTER; visibility = View.GONE }
@@ -324,10 +363,10 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
             setTextColor(Color.WHITE)
             setOnClickListener { toggle("live", def = true) }
         }
-        val flip = icon("⟲", 30f) {
+        val flip = iconBtn(R.drawable.ic_flip, "Switch camera") {
             if (need((caps.optJSONArray("facings")?.length() ?: 0) > 1))
                 svc?.set("facing", if (st.optString("facing") == "front") "back" else "front")
-        }.apply { background = pill(0x22FFFFFF) }
+        }.apply { background = pill(0x22FFFFFF); setPadding(dp(16), dp(16), dp(16), dp(16)) }
         bottom.addView(connText, FrameLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT, Gravity.START or Gravity.CENTER_VERTICAL))
         bottom.addView(liveBtn, FrameLayout.LayoutParams(dp(78), dp(78), Gravity.CENTER))
         bottom.addView(flip, FrameLayout.LayoutParams(dp(58), dp(58), Gravity.END or Gravity.CENTER_VERTICAL))
@@ -336,7 +375,7 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         drawer = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             background = GradientDrawable().apply {
-                setColor(0xF0161616.toInt())
+                setColor(0xFF161618.toInt())
                 cornerRadii = FloatArray(8) { i -> if (i >= 4) dp(24).toFloat() else 0f }
             }
             setPadding(dp(20), dp(12), dp(20), dp(16))
@@ -413,6 +452,81 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         }
         if (drawer.visibility == View.VISIBLE) buildDrawer()
         spec?.let { if (!dragging) syncSlider(it) }
+        renderConnCard(conn.isEmpty() && s.length() > 0)
+    }
+
+    private fun label(t: String, size: Float, color: Int, bold: Boolean = false) = TextView(this).apply {
+        text = t
+        textSize = size
+        setTextColor(color)
+        if (bold) typeface = medium
+    }
+
+    private fun caption(t: String) = label(t.uppercase(), 11f, DIM).apply { letterSpacing = 0.1f }
+
+    /** While no PC is connected: this phone's pairing code, and a search for openCam PCs on the Wi-Fi. */
+    private fun renderConnCard(show: Boolean) {
+        connCard.visibility = if (show) View.VISIBLE else View.GONE
+        if (!show) return
+        val s = st
+        val key = listOf(s.optString("code"), s.optString("pcs"), s.optBoolean("searching")).toString()
+        if (connCard.tag == key) return
+        connCard.tag = key
+        connCard.removeAllViews()
+        connCard.addView(label("Connect to PC", 18f, Color.WHITE, bold = true))
+        connCard.addView(label("openCam on a PC on this Wi-Fi connects by itself. For USB, turn on USB debugging and plug in.",
+            13f, DIM).apply { setPadding(0, dp(4), 0, dp(14)); setLineSpacing(0f, 1.15f) })
+
+        connCard.addView(caption("Pairing code"))
+        val code = s.optString("code")
+        connCard.addView(label(if (code.isEmpty()) "Not on Wi-Fi" else code.chunked(3).joinToString(" "), if (code.isEmpty()) 15f else 34f, Color.WHITE).apply {
+            typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+            letterSpacing = 0.08f
+        })
+        if (code.isNotEmpty()) connCard.addView(label("Type it into openCam on the PC  ·  IP ${s.optString("ip")}", 12f, DIM).apply {
+            setPadding(0, 0, 0, dp(14))
+        })
+
+        val head = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        head.addView(caption("PCs on this network"), LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        val searching = s.optBoolean("searching")
+        head.addView(chip(if (searching) "Searching…" else "Search", 13f) { svc?.searchPcs() }.apply {
+            setTextColor(ACCENT)
+            isEnabled = !searching && code.isNotEmpty()
+            alpha = if (isEnabled) 1f else 0.5f
+        })
+        connCard.addView(head, MATCH_PARENT, WRAP_CONTENT)
+
+        val pcs = s.optJSONArray("pcs")
+        if (pcs == null || pcs.length() == 0) {
+            connCard.addView(label(if (searching) "Looking for PCs…" else "Tap Search to list PCs running openCam.", 13f, DIM).apply {
+                setPadding(0, dp(4), 0, dp(4))
+            })
+        }
+        for (i in 0 until (pcs?.length() ?: 0)) {
+            val pc = pcs!!.getJSONObject(i)
+            val name = pc.optString("name")
+            val row = LinearLayout(this).apply {
+                gravity = Gravity.CENTER_VERTICAL
+                background = round(0x14FFFFFF, 12)
+                setPadding(dp(12), dp(10), dp(14), dp(10))
+                setOnClickListener {
+                    svc?.callPc(pc.optString("ip"))
+                    Toast.makeText(this@MainActivity, "Asking $name to connect…", Toast.LENGTH_SHORT).show()
+                }
+                ripple()
+            }
+            row.addView(ImageView(this).apply { setImageResource(R.drawable.ic_computer); imageTintList = ColorStateList.valueOf(Color.WHITE) },
+                dp(22), dp(22))
+            row.addView(LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(12), 0, 0, 0)
+                addView(label(name, 15f, Color.WHITE, bold = true))
+                addView(label(pc.optString("ip"), 12f, DIM))
+            }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+            row.addView(label("Connect", 14f, ACCENT, bold = true))
+            connCard.addView(row, LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT).apply { topMargin = dp(8) })
+        }
     }
 
     private fun fmtZoom(z: Double) = if (abs(z - z.roundToInt()) < 0.05) "${z.roundToInt()}" else String.format("%.1f", z)
@@ -567,13 +681,23 @@ class MainActivity : Activity(), SurfaceHolder.Callback {
         row(fpsList.map { "$it fps" to (it == fps) }, supported = { "$res@${fpsList[it]}" in modes }) {
             if (need("$res@${fpsList[it]}" in modes)) svc?.set("fps", fpsList[it])
         }
-        header("Bitrate")
+        header("Bitrate (Mbps)")
         val rates = listOf(0, 8, 16, 32, 50)
-        row(rates.map { (if (it == 0) "Auto" else "$it Mbps") to (it == st.optInt("mbps")) }) { svc?.set("mbps", rates[it]) }
+        row(rates.map { (if (it == 0) "Auto" else "$it") to (it == st.optInt("mbps")) }) { svc?.set("mbps", rates[it]) }
         header("PC output")
         row(listOf("Mirror" to st.optBoolean("mirror"), "Rotate 180°" to st.optBoolean("rot180"))) {
             toggle(if (it == 0) "mirror" else "rot180")
         }
+        header("Updates")
+        val upd = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL }
+        val ready = st.optString("updReady")
+        upd.addView(label(st.optString("upd").ifEmpty { "Checks GitHub every 6 hours" } + "\nVersion ${packageManager.getPackageInfo(packageName, 0).versionName}", 13f, DIM).apply {
+            setPadding(dp(4), 0, dp(8), 0)
+        }, LinearLayout.LayoutParams(0, WRAP_CONTENT, 1f))
+        upd.addView(if (ready.isEmpty()) chip("Check now", 14f) { svc?.checkUpdate() }.apply { background = pill(CHIP) }
+        else chip("Install $ready", 14f) { installUpdate() }.apply { background = pill(ACCENT); setTextColor(Color.BLACK) })
+        drawer.addView(upd, MATCH_PARENT, WRAP_CONTENT)
+
         val actions = LinearLayout(this).apply { gravity = Gravity.CENTER_VERTICAL; setPadding(0, dp(18), 0, 0) }
         actions.addView(chip("Quit openCam", 14f) { svc?.quit() ?: finishAndRemoveTask() }.apply { setTextColor(RED) })
         actions.addView(View(this), LinearLayout.LayoutParams(0, 1, 1f))

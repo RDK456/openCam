@@ -28,6 +28,7 @@ import android.media.MediaCodecInfo
 import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.net.ConnectivityManager
+import android.net.LinkAddress
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -38,6 +39,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.util.Range
 import android.util.Size
@@ -56,6 +58,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executor
@@ -128,6 +131,9 @@ class CamService : Service() {
     private var preview: Surface? = null
     private var demand = false
     private var notifText = ""
+    private val pcs = linkedMapOf<String, String>() // PCs that answered [searchPcs]: IP → name
+    private var searchUntil = 0L
+    @Volatile private var udpSock: DatagramSocket? = null
 
     // shared with encoder / network threads
     @Volatile private var conn: Conn? = null
@@ -160,10 +166,10 @@ class CamService : Service() {
         )
         cam.post { selectCamera(); publish() }
         thread(name = "tcp", isDaemon = true) { serve() }
-        thread(name = "beacon", isDaemon = true) { beacon() }
+        thread(name = "udp", isDaemon = true) { udp() }
         thread(name = "update", isDaemon = true) {
             while (running) {
-                runCatching { Updater.check(this) }.getOrNull()?.let { v -> main.post { updateReady(v) } }
+                runUpdateCheck()
                 Thread.sleep(6 * 3600 * 1000L)
             }
         }
@@ -270,6 +276,12 @@ class CamService : Service() {
         c?.sendJson(cp)
         c?.sendJson(st)
         val cb = onUpdate ?: return
+        // UI-only extras: this phone's address and pairing code (its low 16 bits), PCs found, update state
+        val la = wifiNet?.let { linkAddr(it) }
+        if (la != null) st.put("ip", la.address.hostAddress).put("code", "%05d".format(ipInt(la) and 0xFFFF))
+        st.put("pcs", JSONArray(pcs.map { (ip, name) -> JSONObject().put("ip", ip).put("name", name) }))
+            .put("searching", SystemClock.elapsedRealtime() < searchUntil)
+            .put("upd", updStatus).put("updReady", updReady)
         main.post { cb(cp, st) }
     }
 
@@ -630,35 +642,111 @@ class CamService : Service() {
         }
     }
 
-    /** Announces the phone on Wi-Fi while no PC is connected; pings the PC while one is. */
-    private fun beacon() {
-        val msg = "OPENCAM1|${Build.MODEL}|$TCP_PORT".toByteArray()
+    /**
+     * UDP 47101 (PROTOCOL.md): announces the phone every second while no PC is connected (pings the PC while one
+     * is), answers PC scans, and collects the PCs that answer [searchPcs].
+     */
+    private fun udp() {
+        val buf = ByteArray(256)
+        var sock: DatagramSocket? = null
+        var bound: Network? = null
+        var lastBeacon = 0L
         while (running) {
             try {
-                val c = conn
                 val net = wifiNet
-                if (c != null) {
-                    c.sendJson(JSONObject().put("t", "ping"))
-                } else if (net != null) {
-                    val addr = broadcastAddr(net)
-                    if (addr != null) DatagramSocket().use {
-                        it.broadcast = true
-                        net.bindSocket(it)
-                        it.send(DatagramPacket(msg, msg.size, addr, UDP_PORT))
+                if (net != bound) {
+                    sock?.close()
+                    sock = null
+                    bound = net
+                    if (net != null) sock = DatagramSocket(null).apply {
+                        reuseAddress = true
+                        broadcast = true
+                        soTimeout = 250
+                        bind(InetSocketAddress(UDP_PORT))
+                        net.bindSocket(this)
                     }
+                    udpSock = sock
+                }
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastBeacon >= 1000) {
+                    lastBeacon = now
+                    val c = conn
+                    if (c != null) c.sendJson(JSONObject().put("t", "ping"))
+                    else if (net != null) linkAddr(net)?.let { sock?.send(DatagramPacket(beaconMsg, beaconMsg.size, broadcastAddr(it), UDP_PORT)) }
+                }
+                val s = sock ?: run { Thread.sleep(250); null } ?: continue
+                val p = DatagramPacket(buf, buf.size)
+                try { s.receive(p) } catch (_: SocketTimeoutException) { continue }
+                val text = String(p.data, 0, p.length)
+                if (text == "OPENCAM?") s.send(DatagramPacket(beaconMsg, beaconMsg.size, p.socketAddress))
+                else if (text.startsWith("OPENCAMPC|")) {
+                    val ip = p.address.hostAddress ?: continue
+                    cam.post { pcs[ip] = text.substringAfter('|'); publish() }
                 }
             } catch (e: Exception) {
-                Log.d(TAG, "beacon: $e")
+                Log.d(TAG, "udp: $e")
+                Thread.sleep(1000)
             }
-            Thread.sleep(1000)
+        }
+        sock?.close()
+    }
+
+    private val beaconMsg = "OPENCAM1|${Build.MODEL}|$TCP_PORT".toByteArray()
+
+    private fun linkAddr(net: Network) =
+        connectivity.getLinkProperties(net)?.linkAddresses?.firstOrNull { it.address is Inet4Address }
+
+    private fun ipInt(la: LinkAddress) = ByteBuffer.wrap(la.address.address).int
+
+    private fun maskOf(la: LinkAddress) = if (la.prefixLength == 0) 0 else -1 shl (32 - la.prefixLength)
+
+    private fun addr(ip: Int): InetAddress = InetAddress.getByAddress(ByteBuffer.allocate(4).putInt(ip).array())
+
+    private fun broadcastAddr(la: LinkAddress) = addr(ipInt(la) or maskOf(la).inv())
+
+    /** Phone-side search: asks every address on the Wi-Fi subnet (up to /22, else just broadcast) for an openCam PC. */
+    fun searchPcs() {
+        cam.post { pcs.clear(); searchUntil = SystemClock.elapsedRealtime() + 2000; publish() }
+        cam.postDelayed({ publish() }, 2100)
+        thread(isDaemon = true) {
+            val s = udpSock ?: return@thread
+            val la = wifiNet?.let { linkAddr(it) } ?: return@thread
+            val q = "OPENCAMPC?".toByteArray()
+            val ip = ipInt(la)
+            val mask = maskOf(la)
+            val targets = if (la.prefixLength >= 22) (1 until mask.inv()).map { (ip and mask) or it }.filter { it != ip }
+            else listOf(ip or mask.inv())
+            for (t in targets) runCatching { s.send(DatagramPacket(q, q.size, addr(t), UDP_PORT)) }
         }
     }
 
-    private fun broadcastAddr(net: Network): InetAddress? {
-        val la = connectivity.getLinkProperties(net)?.linkAddresses?.firstOrNull { it.address is Inet4Address } ?: return null
-        val ip = ByteBuffer.wrap(la.address.address).int
-        val mask = if (la.prefixLength == 0) 0 else -1 shl (32 - la.prefixLength)
-        return InetAddress.getByAddress(ByteBuffer.allocate(4).putInt(ip or mask.inv()).array())
+    /** A PC tapped in the search list: beacon straight at it, and it connects (PCs connect to any beacon). */
+    fun callPc(ip: String) {
+        thread(isDaemon = true) {
+            val s = udpSock ?: return@thread
+            repeat(3) {
+                runCatching { s.send(DatagramPacket(beaconMsg, beaconMsg.size, InetAddress.getByName(ip), UDP_PORT)) }
+                Thread.sleep(300)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- updates
+
+    @Volatile private var updStatus = ""
+    @Volatile private var updReady = ""
+
+    fun checkUpdate() { thread(isDaemon = true) { runUpdateCheck() } }
+
+    private fun runUpdateCheck() {
+        updStatus = "Checking for updates…"
+        cam.post { publish() }
+        updStatus = try {
+            Updater.check(this)?.let { v -> updReady = v; main.post { updateReady(v) }; "$v is ready to install" } ?: "Up to date"
+        } catch (e: IOException) {
+            e.message ?: "Update check failed"
+        }
+        cam.post { publish() }
     }
 
     /** Leaving Wi-Fi range or switching networks ends the session, unless the PC is on USB. */
@@ -667,6 +755,7 @@ class CamService : Service() {
             val prev = wifiNet
             wifiNet = n
             if (prev != null && prev != n) leaveIfWireless("Wi-Fi network changed")
+            publish() // the pairing code changes with the address
         }
         override fun onLost(n: Network) {
             if (n == wifiNet) { wifiNet = null; leaveIfWireless("Wi-Fi lost") }

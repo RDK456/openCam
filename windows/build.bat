@@ -17,6 +17,6 @@ rc /nologo /fo out\app.res app.rc || exit /b 1
 cl /nologo /Brepro /utf-8 /O2 /EHsc /std:c++17 /W3 /MT /DOPENCAM_VERSION=\"%VER%\" app.cpp out\app.res /Fe:out\openCam.exe /Fo:out\ ^
    /link /Brepro /SUBSYSTEM:WINDOWS mfplat.lib mfuuid.lib mf.lib mfsensorgroup.lib wmcodecdspuuid.lib ^
    ole32.lib ws2_32.lib user32.lib gdi32.lib shell32.lib advapi32.lib d2d1.lib dwrite.lib dwmapi.lib ^
-   wininet.lib bcrypt.lib msdelta.lib || exit /b 1
+   wininet.lib bcrypt.lib msdelta.lib iphlpapi.lib || exit /b 1
 
 echo Built out\openCam.exe %VER% and out\opencam_vcam.dll

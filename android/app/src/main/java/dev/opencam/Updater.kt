@@ -42,9 +42,10 @@ object Updater {
 
     private fun staged(ctx: Context) = File(ctx.cacheDir, "update.apk")
 
-    /** Blocking. Returns the newer version once its APK is staged and verified, else null. */
+    /** Blocking. Returns the newer version once its APK is staged and verified, null when up to date; throws when
+     *  GitHub can't be reached or the download doesn't verify. */
     fun check(ctx: Context): String? {
-        val m = fetch("manifest.json")?.let { JSONObject(String(it)) } ?: return null
+        val m = fetch("manifest.json")?.let { JSONObject(String(it)) } ?: throw IOException("Couldn't reach GitHub")
         val ver = m.optString("version")
         val cur = ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: return null
         if (code(ver) <= code(cur)) return null
@@ -53,7 +54,7 @@ object Updater {
         if (out.exists() && sha(out) == want) return ver
         fetch("openCam.apk.from-$cur.delta")?.let { runCatching { patch(File(ctx.applicationInfo.sourceDir), it, out) } }
         if (!out.exists() || sha(out) != want) fetch("openCam.apk")?.let { out.writeBytes(it) }
-        return if (out.exists() && sha(out) == want) ver else null
+        return if (out.exists() && sha(out) == want) ver else throw IOException("Download of $ver failed")
     }
 
     /** Inverse of BlockDelta in windows/app.cpp. */

@@ -50,7 +50,15 @@ Android SDK location. USB is tried first whenever both are available.
 
 ### Wireless
 
-Same Wi-Fi network as the PC. The phone announces itself and the PC connects on its own, with no IP to type.
+Same Wi-Fi network as the PC. The phone announces itself, the PC also scans its network every few seconds, and they
+connect on their own. The PC remembers the last phone and tries it first. If that doesn't work:
+
+- **PC:** pick the phone from *Phones on this network* (or *Scan again*), or type the phone's **pairing code** (5 digits,
+  shown on the phone while no PC is connected) or its IP address.
+- **Phone:** tap **Search** under *PCs on this network* and tap your PC.
+
+The one-time UAC step also adds a Windows Firewall rule for UDP 47101 (openCam only) so phone beacons get through.
+Networks with client isolation (some guest/public Wi-Fi) block devices from seeing each other; use USB there.
 
 ## Controls (phone and PC)
 
@@ -64,14 +72,15 @@ using the camera. Otherwise it stays off to save battery.
 
 ## Updates
 
-Both apps check [GitHub Releases](https://github.com/RDK456/openCam/releases) every 6 hours. A delta against the
+Both apps check [GitHub Releases](https://github.com/RDK456/openCam/releases) every 6 hours, or right away with
+**Check now** under *Updates* in the settings (gear) panel, which also shows the current version and status. A delta against the
 installed version is downloaded when the release has one; otherwise the full file is downloaded. Either way it is
 checked against the release's SHA-256 manifest before use.
 
 - **PC:** installs on its own, but only once no app is using the camera and the window is closed; then it restarts
-  in the tray. A UAC prompt appears only when the camera DLL changed.
-- **Phone:** shows an "openCam X is ready" notification. Tap it and confirm Android's install prompt (the first time,
-  allow *Install unknown apps* for openCam).
+  in the tray. **Restart now** installs it at once. A UAC prompt appears only when the camera DLL changed.
+- **Phone:** shows an "openCam X is ready" notification and an **Install** button in settings. Tap either and confirm
+  Android's install prompt (the first time, allow *Install unknown apps* for openCam).
 
 Publish a release with `.\release.ps1 1.2.3`: it builds both apps, makes deltas from the previous release, writes the
 manifest, tags, pushes, and creates the GitHub release.

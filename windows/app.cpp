@@ -5,6 +5,7 @@
 #define NOMINMAX
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <iphlpapi.h>
 #include "common.h"
 #include <objbase.h>
 #include <shellapi.h>
@@ -340,33 +341,114 @@ struct Decoder {
 
 // ================================================================== networking
 
-static std::mutex g_bm;
-static std::string g_beaconIp;
-static ULONGLONG g_beaconTick;
+/** A phone heard on Wi-Fi: its beacon, or its answer to Scan(). */
+struct Phone { std::string ip, model; ULONGLONG tick; };
+static std::mutex g_bm; // guards the block below
+static std::vector<Phone> g_phones;
+static std::string g_target;   // phone tried first: picked in the UI, typed as a code or IP, or the last one used
+static int g_wantCode = -1;    // pairing code being looked up: the low 16 bits of the phone's IPv4 address
+static std::wstring g_findMsg; // result of the last code / IP entry
+static ULONGLONG g_scanTick;
+static SOCKET g_udp = INVALID_SOCKET;
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12) // mstcpip.h
+#endif
 
-/** Phones on Wi-Fi announce themselves on UDP 47101 (see PROTOCOL.md). */
+static std::wstring RegStr(const wchar_t* name) {
+    wchar_t v[256];
+    DWORD n = sizeof v;
+    return RegGetValueW(HKEY_CURRENT_USER, L"Software\\openCam", name, RRF_RT_REG_SZ, nullptr, v, &n) ? L"" : v;
+}
+
+static void SetRegStr(const wchar_t* name, const std::wstring& v) {
+    RegSetKeyValueW(HKEY_CURRENT_USER, L"Software\\openCam", name, REG_SZ, v.c_str(), (DWORD)((v.size() + 1) * sizeof(wchar_t)));
+}
+
+/** UDP 47101 (PROTOCOL.md): phone beacons and scan answers come in; phones searching for PCs get our name. */
 static void BeaconThread() {
-    SOCKET u = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    BOOL on = TRUE;
-    setsockopt(u, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof on);
-    sockaddr_in a = {};
-    a.sin_family = AF_INET;
-    a.sin_port = htons(47101);
-    bind(u, (sockaddr*)&a, sizeof a);
+    static const char P[] = "OPENCAM1|";
     char buf[256];
     while (!g_quit) {
         sockaddr_in from = {};
         int fl = sizeof from;
-        int n = recvfrom(u, buf, sizeof buf - 1, 0, (sockaddr*)&from, &fl);
-        if (n <= 0) { Sleep(200); continue; }
+        int n = recvfrom(g_udp, buf, sizeof buf - 1, 0, (sockaddr*)&from, &fl);
+        if (n <= 0) { if (WSAGetLastError() != WSAETIMEDOUT) Sleep(50); continue; }
         buf[n] = 0;
-        if (strncmp(buf, "OPENCAM1|", 10)) continue;
+        if (!strcmp(buf, "OPENCAMPC?")) {
+            char host[MAX_COMPUTERNAME_LENGTH + 1];
+            DWORD hn = sizeof host;
+            GetComputerNameA(host, &hn);
+            std::string r = std::string("OPENCAMPC|") + host;
+            sendto(g_udp, r.data(), (int)r.size(), 0, (sockaddr*)&from, fl);
+            continue;
+        }
+        if (strncmp(buf, P, sizeof P - 1)) continue;
+        std::string model = buf + sizeof P - 1;
+        model = model.substr(0, model.find('|'));
         char ip[64];
         inet_ntop(AF_INET, &from.sin_addr, ip, sizeof ip);
-        std::lock_guard<std::mutex> l(g_bm);
-        g_beaconIp = ip;
-        g_beaconTick = GetTickCount64();
+        {
+            std::lock_guard<std::mutex> l(g_bm);
+            auto it = std::find_if(g_phones.begin(), g_phones.end(), [&](const Phone& p) { return p.ip == ip; });
+            if (it == g_phones.end()) g_phones.push_back({ip, model, GetTickCount64()});
+            else { it->model = model; it->tick = GetTickCount64(); }
+            if (g_wantCode >= 0 && (int)(ntohl(from.sin_addr.s_addr) & 0xFFFF) == g_wantCode) {
+                g_target = ip;
+                g_wantCode = -1;
+                g_findMsg = L"Found " + Wide(model) + L", connecting…";
+            }
+        }
+        Invalidate();
     }
+}
+
+/** Sends "OPENCAM?" to every address of each local IPv4 subnet up to /22, or with code >= 0 only to the address
+ *  that pairing code names on each subnet. Phones answer from UDP 47101; Windows Firewall lets those answers in
+ *  even without an inbound rule because they reply to our own packets. */
+static void Scan(int code = -1) {
+    ULONG sz = 64 << 10;
+    std::vector<BYTE> b(sz);
+    auto* a = (IP_ADAPTER_ADDRESSES*)b.data();
+    if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER, nullptr, a, &sz)) return;
+    if (code < 0) {
+        std::lock_guard<std::mutex> l(g_bm);
+        g_scanTick = GetTickCount64();
+    }
+    static const char Q[] = "OPENCAM?";
+    auto send = [](u_long ip) {
+        sockaddr_in to = {};
+        to.sin_family = AF_INET;
+        to.sin_port = htons(47101);
+        to.sin_addr.s_addr = htonl(ip);
+        sendto(g_udp, Q, sizeof Q - 1, 0, (sockaddr*)&to, sizeof to);
+    };
+    for (; a; a = a->Next) {
+        if (a->OperStatus != IfOperStatusUp || a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        for (auto* u = a->FirstUnicastAddress; u; u = u->Next) {
+            UINT8 pl = u->OnLinkPrefixLength;
+            u_long ip = ntohl(((sockaddr_in*)u->Address.lpSockaddr)->sin_addr.s_addr);
+            if (code >= 0) { send((ip & 0xFFFF0000) | (u_long)code); continue; }
+            if (pl < 22 || pl > 30) continue;
+            u_long mask = ~0ul << (32 - pl), net = ip & mask;
+            for (u_long h = 1; h < ~mask; h++) if ((net | h) != ip) send(net | h);
+        }
+    }
+}
+
+/** Code or IP typed in the window. A code is the phone's address minus the network part this PC already knows. */
+static void Find(const std::wstring& text) {
+    std::string s(text.begin(), text.end());
+    in_addr a;
+    std::lock_guard<std::mutex> l(g_bm);
+    if (s.find('.') != std::string::npos) {
+        if (inet_pton(AF_INET, s.c_str(), &a) != 1) { g_findMsg = L"That isn't a valid IP address"; return; }
+        g_target = s;
+        g_findMsg = L"Connecting to " + text + L"…";
+    } else if (!s.empty() && s.size() <= 5 && atoi(s.c_str()) <= 0xFFFF) {
+        g_wantCode = atoi(s.c_str());
+        g_findMsg = L"Looking for code " + text + L"…";
+        std::thread([c = g_wantCode] { Scan(c); }).detach();
+    } else g_findMsg = L"Enter the 5-digit code shown on the phone, or its IP address";
 }
 
 static std::wstring FindAdb() {
@@ -380,20 +462,23 @@ static std::wstring FindAdb() {
     return L"";
 }
 
-/** `adb forward tcp:47100 tcp:47100`. Succeeds only with an authorised phone on USB. */
-static bool AdbForward() {
-    static std::wstring adb = FindAdb();
-    if (adb.empty()) return false;
-    std::wstring cmd = L"\"" + adb + L"\" forward tcp:47100 tcp:47100";
+/** Runs a console program hidden; its exit code, or 1 when it fails to start or finish. */
+static DWORD Run(std::wstring cmd) {
     STARTUPINFOW si = {sizeof si};
     PROCESS_INFORMATION pi;
-    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return false;
+    if (!CreateProcessW(nullptr, &cmd[0], nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return 1;
     DWORD code = 1;
     if (WaitForSingleObject(pi.hProcess, 8000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess, &code);
     else TerminateProcess(pi.hProcess, 1);
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
-    return code == 0;
+    return code;
+}
+
+/** `adb forward tcp:47100 tcp:47100`. Succeeds only with an authorised phone on USB. */
+static bool AdbForward() {
+    static std::wstring adb = FindAdb();
+    return !adb.empty() && Run(L"\"" + adb + L"\" forward tcp:47100 tcp:47100") == 0;
 }
 
 static SOCKET Connect(const char* ip, int timeoutMs) {
@@ -532,7 +617,20 @@ static void NetThread() {
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     WSADATA w;
     WSAStartup(MAKEWORD(2, 2), &w);
+    g_udp = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    BOOL on = TRUE, off = FALSE;
+    DWORD to = 1000, got;
+    setsockopt(g_udp, SOL_SOCKET, SO_REUSEADDR, (const char*)&on, sizeof on);
+    setsockopt(g_udp, SOL_SOCKET, SO_RCVTIMEO, (const char*)&to, sizeof to);
+    // Scanning hits addresses with nothing on 47101; don't let their ICMP replies fail later receives.
+    WSAIoctl(g_udp, SIO_UDP_CONNRESET, &off, sizeof off, nullptr, 0, &got, nullptr, nullptr);
+    sockaddr_in a = {};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(47101);
+    bind(g_udp, (sockaddr*)&a, sizeof a);
     std::thread(BeaconThread).detach();
+    std::wstring last = RegStr(L"LastPhone");
+    g_target = std::string(last.begin(), last.end());
     while (!g_quit) {
         OpenShared();
         // USB first: lower latency and no Wi-Fi needed. RunSession drops a Wi-Fi link once USB appears.
@@ -540,16 +638,33 @@ static void NetThread() {
             SOCKET s = Connect("127.0.0.1", 1000);
             if (s != INVALID_SOCKET) { RunSession(s, true); closesocket(s); continue; }
         }
-        std::string ip;
+        // Wi-Fi: the chosen / last phone first (works even where UDP is blocked), then any phone heard lately.
+        std::vector<std::string> ips;
+        bool scan;
         {
             std::lock_guard<std::mutex> l(g_bm);
-            if (GetTickCount64() - g_beaconTick < 3000) ip = g_beaconIp;
+            ULONGLONG now = GetTickCount64();
+            if (!g_target.empty()) ips.push_back(g_target);
+            for (auto& p : g_phones) if (now - p.tick < 6000 && p.ip != g_target) ips.push_back(p.ip);
+            scan = now - g_scanTick > 5000;
         }
-        if (!ip.empty()) {
+        if (scan) Scan();
+        bool ran = false;
+        for (auto& ip : ips) {
             SOCKET s = Connect(ip.c_str(), 1500);
-            if (s != INVALID_SOCKET) { RunSession(s, false); closesocket(s); continue; }
+            if (s == INVALID_SOCKET) continue;
+            {
+                std::lock_guard<std::mutex> l(g_bm);
+                g_target = ip;
+                g_findMsg.clear();
+            }
+            SetRegStr(L"LastPhone", Wide(ip));
+            RunSession(s, false);
+            closesocket(s);
+            ran = true;
+            break;
         }
-        Sleep(1000);
+        if (!ran) Sleep(1000);
     }
 }
 
@@ -677,15 +792,25 @@ static int CallDll(const std::wstring& dll, const char* fn) {
     return SUCCEEDED(hr) ? 0 : 2;
 }
 
-/** Elevated: copy the DLL where Frame Server (LocalService) can read it and register its CLSID. */
+static std::wstring Netsh(const std::wstring& args) {
+    wchar_t p[MAX_PATH];
+    ExpandEnvironmentStringsW(L"%SystemRoot%\\System32\\netsh.exe", p, MAX_PATH);
+    return L"\"" + std::wstring(p) + L"\" advfirewall firewall " + args;
+}
+
+/** Elevated: copy the DLL where Frame Server (LocalService) can read it and register its CLSID, and let phone
+ *  beacons (UDP 47101 only) through Windows Firewall on any network profile. */
 static int Install() {
     std::wstring dst = InstallDir() + L"\\opencam_vcam.dll";
     CreateDirectoryW(InstallDir().c_str(), nullptr);
     CopyFileW((ExeDir() + L"\\opencam_vcam.dll").c_str(), dst.c_str(), FALSE); // may fail if in use; keep the old one
+    Run(Netsh(L"delete rule name=openCam"));
+    Run(Netsh(L"add rule name=openCam dir=in action=allow protocol=UDP localport=47101 profile=any program=\"" + ExePath() + L"\""));
     return CallDll(dst, "DllRegisterServer");
 }
 
 static int Uninstall() {
+    Run(Netsh(L"delete rule name=openCam"));
     std::wstring dst = InstallDir() + L"\\opencam_vcam.dll";
     int r = CallDll(dst, "DllUnregisterServer");
     DeleteFileW(dst.c_str());
@@ -699,7 +824,8 @@ static bool NeedsInstall() {
     if (RegGetValueW(HKEY_LOCAL_MACHINE, CLSID_KEY, nullptr, RRF_RT_REG_SZ, nullptr, v, &n)) return true;
     if (_wcsicmp(v, (InstallDir() + L"\\opencam_vcam.dll").c_str())) return true;
     std::string local = ReadAll(ExeDir() + L"\\opencam_vcam.dll");
-    return !local.empty() && local != ReadAll(v); // a different build sits next to the exe
+    if (!local.empty() && local != ReadAll(v)) return true; // a different build sits next to the exe
+    return Run(Netsh(L"show rule name=openCam")) != 0;
 }
 
 static void EnsureInstalled() {
@@ -763,8 +889,18 @@ static void StartVirtualCamera() {
 
 static const wchar_t* RELEASES = L"https://github.com/RDK456/openCam/releases/latest/download/";
 static const char* UPDATE_FILES[] = {"openCam.exe", "opencam_vcam.dll"};
-static std::string g_update; // guarded by g_m: staged version waiting for the camera to go idle
-static std::atomic<bool> g_restart{false};
+static std::string g_update;     // guarded by g_m: staged version waiting for the camera to go idle
+static std::wstring g_updStatus; // guarded by g_m: shown in the settings drawer
+static std::atomic<bool> g_restart{false}, g_updNow{false};
+static HANDLE g_updWake = CreateEventW(nullptr, FALSE, FALSE, nullptr); // "Check now" / "Restart now"
+
+static void UpdStatus(const std::wstring& s) {
+    {
+        std::lock_guard<std::mutex> l(g_m);
+        g_updStatus = s;
+    }
+    Invalidate();
+}
 
 /** HTTPS GET; WinINet follows GitHub's redirect to its download host. */
 static bool Fetch(const std::wstring& url, std::string& out) {
@@ -787,16 +923,18 @@ static int Ver(const std::string& v) {
     return a * 1000000 + b * 1000 + c;
 }
 
-/** Every 6 h: when GitHub has a newer release, fetch it (a delta when one matches this version, else the full
- *  file; both checked against the manifest's SHA-256), stage it as *.new, wait until nothing uses the camera and
- *  the window is closed, then swap the files and restart. */
+/** A minute after start, then every 6 h or on "Check now": when GitHub has a newer release, fetch it (a delta when
+ *  one matches this version, else the full file; both checked against the manifest's SHA-256), stage it as *.new,
+ *  wait until nothing uses the camera and the window is closed (or "Restart now"), then swap the files and restart. */
 static void UpdateThread() {
-    for (Sleep(60 * 1000);; Sleep(6 * 3600 * 1000)) {
+    for (WaitForSingleObject(g_updWake, 60 * 1000);; WaitForSingleObject(g_updWake, 6 * 3600 * 1000)) {
+        UpdStatus(L"Checking for updates…");
         std::string m;
-        if (!Fetch(std::wstring(RELEASES) + L"manifest.json", m)) continue;
+        if (!Fetch(std::wstring(RELEASES) + L"manifest.json", m)) { UpdStatus(L"Couldn't reach GitHub"); continue; }
         Json j = ParseStr(m);
         std::string ver = j["version"].str();
-        if (Ver(ver) <= Ver(OPENCAM_VERSION)) continue;
+        if (Ver(ver) <= Ver(OPENCAM_VERSION)) { UpdStatus(L"Up to date"); continue; }
+        UpdStatus(L"Downloading " + Wide(ver) + L"…");
         bool ok = true;
         for (const char* name : UPDATE_FILES) {
             std::wstring path = ExeDir() + L"\\" + Wide(name);
@@ -807,13 +945,14 @@ static void UpdateThread() {
             if (!ok || !WriteAll(path + L".new", next)) { ok = false; break; }
         }
         Log(ok ? "update %s staged" : "update %s failed", ver.c_str());
-        if (!ok) continue;
+        if (!ok) { UpdStatus(L"Download of " + Wide(ver) + L" failed"); continue; }
         {
             std::lock_guard<std::mutex> l(g_m);
             g_update = ver;
         }
-        Invalidate();
-        while (g_visible || ConsumerActive()) Sleep(5000); // never restart under a running call
+        UpdStatus(Wide(ver) + L" is ready");
+        // never restart under a running call unless asked to
+        while (!g_updNow && (g_visible || ConsumerActive())) WaitForSingleObject(g_updWake, 5000);
         for (const char* name : UPDATE_FILES) {
             std::wstring path = ExeDir() + L"\\" + Wide(name);
             if (GetFileAttributesW((path + L".new").c_str()) == INVALID_FILE_ATTRIBUTES) continue;
@@ -852,12 +991,32 @@ static bool g_dragging = false;
 
 static float Scale() { return g_hwnd ? GetDpiForWindow(g_hwnd) / 96.f : 1.f; }
 
-static IDWriteTextFormat* Font(float size, bool bold) {
-    int key = (int)(size * 10) * 2 + (bold ? 1 : 0);
+static constexpr UINT32 SURFACE = 0x1C1C1E, MUTED = 0xA1A1AA;
+// Segoe Fluent Icons (ships with Windows 11) code points
+#define IC_TORCH L""
+#define IC_ROTATE L""
+#define IC_MIRROR L""
+#define IC_SETTINGS L""
+#define IC_FLIP L""
+#define IC_CLOSE L""
+#define IC_PHONE L""
+#define IC_REFRESH L""
+
+static D2D1_POINT_2F g_mouse = {-1, -1};
+static bool g_editing = false; // the pairing-code field has focus
+static std::wstring g_edit;
+
+static bool In(D2D1_RECT_F r, D2D1_POINT_2F p) { return p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom; }
+
+static bool IsIcon(const std::wstring& s) { return s.size() == 1 && s[0] >= 0xE000 && s[0] <= 0xF8FF; }
+
+static IDWriteTextFormat* Font(float size, bool bold, bool icon = false) {
+    int key = ((int)(size * 10) * 2 + (bold ? 1 : 0)) * 2 + (icon ? 1 : 0);
     auto& f = g_fonts[key];
     if (!f) {
-        g_dw->CreateTextFormat(L"Segoe UI", nullptr, bold ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL,
-                               DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", &f);
+        g_dw->CreateTextFormat(icon ? L"Segoe Fluent Icons" : L"Segoe UI Variable Text", nullptr,
+                               bold ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+                               DWRITE_FONT_STRETCH_NORMAL, size, L"en-us", &f);
         f->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
         f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     }
@@ -865,11 +1024,20 @@ static IDWriteTextFormat* Font(float size, bool bold) {
 }
 
 static void Text(const std::wstring& s, D2D1_RECT_F r, float size, UINT32 rgb, float alpha = 1,
-                 DWRITE_TEXT_ALIGNMENT al = DWRITE_TEXT_ALIGNMENT_CENTER, bool bold = true) {
-    IDWriteTextFormat* f = Font(size, bold);
+                 DWRITE_TEXT_ALIGNMENT al = DWRITE_TEXT_ALIGNMENT_CENTER, bool bold = true, bool wrap = false) {
+    IDWriteTextFormat* f = Font(size, bold, IsIcon(s));
     f->SetTextAlignment(al);
+    if (wrap) f->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
     g_br->SetColor(D2D1::ColorF(rgb, alpha));
     g_rt->DrawText(s.c_str(), (UINT32)s.size(), f, r, g_br.Get());
+    if (wrap) f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+}
+
+static float TextW(const std::wstring& s, float size, bool bold = true) {
+    ComPtr<IDWriteTextLayout> l;
+    DWRITE_TEXT_METRICS m = {};
+    if (SUCCEEDED(g_dw->CreateTextLayout(s.c_str(), (UINT32)s.size(), Font(size, bold, IsIcon(s)), 4096, 100, &l))) l->GetMetrics(&m);
+    return m.widthIncludingTrailingWhitespace;
 }
 
 static void Fill(D2D1_RECT_F r, UINT32 rgb, float a, float radius) {
@@ -877,10 +1045,28 @@ static void Fill(D2D1_RECT_F r, UINT32 rgb, float a, float radius) {
     g_rt->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), g_br.Get());
 }
 
-static void Chip(D2D1_RECT_F r, const std::wstring& label, bool on, bool supported, std::function<void()> f, float size = 13) {
-    if (on) Fill(r, WHITE, 0.18f, (r.bottom - r.top) / 2);
-    Text(label, r, size, on ? ACCENT : WHITE, supported ? 1.f : 0.3f);
+static void Stroke(D2D1_RECT_F r, UINT32 rgb, float a, float radius) {
+    g_br->SetColor(D2D1::ColorF(rgb, a));
+    g_rt->DrawRoundedRectangle(D2D1::RoundedRect(r, radius, radius), g_br.Get(), 1);
+}
+
+/** Pill toggle: highlighted when on, a faint wash under the mouse, dimmed and inert when unsupported. */
+static void Chip(D2D1_RECT_F r, const std::wstring& label, bool on, bool supported, std::function<void()> f, float size = 13,
+                 UINT32 rgb = WHITE) {
+    float rad = (r.bottom - r.top) / 2;
+    if (on) Fill(r, WHITE, 0.18f, rad);
+    else if (supported && In(r, g_mouse)) Fill(r, WHITE, 0.08f, rad);
+    Text(label, r, size, on ? ACCENT : rgb, supported ? 1.f : 0.3f);
     if (supported) g_btns.push_back({r, f});
+}
+
+/** Rectangular action button; primary is the accent fill. */
+static void Button(D2D1_RECT_F r, const std::wstring& label, bool primary, std::function<void()> f) {
+    bool hov = In(r, g_mouse);
+    if (primary) Fill(r, ACCENT, hov ? 0.85f : 1, 8);
+    else Fill(r, WHITE, hov ? 0.16f : 0.1f, 8);
+    Text(label, r, 13, primary ? 0x000000 : WHITE);
+    g_btns.push_back({r, f});
 }
 
 static std::wstring FmtZoom(double z) {
@@ -1005,6 +1191,77 @@ static void DrawPreview(D2D1_RECT_F vf, bool& drew) {
     drew = true;
 }
 
+/** Shown while no phone is connected: phones found on the network, and pairing code / IP entry. */
+static void ConnectPanel(D2D1_RECT_F vf) {
+    std::vector<Phone> phones;
+    std::wstring msg;
+    bool scanning;
+    {
+        std::lock_guard<std::mutex> l(g_bm);
+        ULONGLONG now = GetTickCount64();
+        for (auto& p : g_phones) if (now - p.tick < 10000) phones.push_back(p);
+        msg = g_findMsg;
+        scanning = now - g_scanTick < 1500;
+    }
+    float w = std::min(460.f, vf.right - vf.left - 48), x = (vf.left + vf.right - w) / 2, r = x + w;
+    float h = 300 + std::max<size_t>(1, phones.size()) * 64.f;
+    float y = std::max(vf.top + 16, (vf.top + vf.bottom - h) / 2);
+    auto header = [&](const wchar_t* t) { Text(t, {x + 2, y, r, y + 20}, 11, MUTED, 1, DWRITE_TEXT_ALIGNMENT_LEADING); };
+
+    Text(IC_PHONE, {x, y, r, y + 40}, 30, WHITE);
+    y += 44;
+    Text(L"Connect your phone", {x, y, r, y + 30}, 22, WHITE);
+    y += 32;
+    Text(L"Open openCam on the phone. On the same Wi-Fi it connects by itself; for USB, turn on USB debugging.",
+         {x + 16, y, r - 16, y + 40}, 13, MUTED, 1, DWRITE_TEXT_ALIGNMENT_CENTER, false, true);
+    y += 60;
+
+    header(L"PHONES ON THIS NETWORK");
+    if (scanning) Text(L"Scanning…", {x, y, r - 4, y + 20}, 12, MUTED, 1, DWRITE_TEXT_ALIGNMENT_TRAILING, false);
+    else Chip({r - 104, y - 6, r, y + 26}, L"Scan again", false, true, [] { std::thread([] { Scan(); }).detach(); }, 12);
+    y += 30;
+    if (phones.empty()) {
+        Fill({x, y, r, y + 56}, SURFACE, 1, 12);
+        Text(L"None yet. Keep openCam open on the phone.", {x, y, r, y + 56}, 13, MUTED, 1, DWRITE_TEXT_ALIGNMENT_CENTER, false);
+        y += 64;
+    }
+    for (auto& p : phones) {
+        D2D1_RECT_F row = {x, y, r, y + 56};
+        Fill(row, In(row, g_mouse) ? 0x2C2C2E : SURFACE, 1, 12);
+        Text(IC_PHONE, {x + 12, y, x + 44, y + 56}, 18, WHITE);
+        Text(Wide(p.model), {x + 52, y + 8, r - 100, y + 30}, 14, WHITE, 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+        Text(Wide(p.ip), {x + 52, y + 28, r - 100, y + 48}, 12, MUTED, 1, DWRITE_TEXT_ALIGNMENT_LEADING, false);
+        Text(L"Connect", {r - 100, y, r - 16, y + 56}, 13, ACCENT, 1, DWRITE_TEXT_ALIGNMENT_TRAILING);
+        g_btns.push_back({row, [p] {
+            std::lock_guard<std::mutex> l(g_bm);
+            g_target = p.ip;
+            g_findMsg = L"Connecting to " + Wide(p.model) + L"…";
+        }});
+        y += 64;
+    }
+    y += 12;
+
+    header(L"OR ENTER THE PAIRING CODE");
+    y += 26;
+    D2D1_RECT_F field = {x, y, r - 108, y + 40};
+    Fill(field, SURFACE, 1, 8);
+    Stroke(field, g_editing ? ACCENT : WHITE, g_editing ? 1 : 0.14f, 8);
+    D2D1_RECT_F tr = {field.left + 14, field.top, field.right - 14, field.bottom};
+    if (g_edit.empty() && !g_editing) Text(L"5-digit code or IP address", tr, 14, MUTED, 1, DWRITE_TEXT_ALIGNMENT_LEADING, false);
+    else {
+        Text(g_edit, tr, 15, WHITE, 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+        if (g_editing && GetTickCount64() / 530 % 2 == 0) {
+            float cx = tr.left + TextW(g_edit, 15) + 1;
+            Fill({cx, field.top + 10, cx + 1.5f, field.bottom - 10}, ACCENT, 1, 0);
+        }
+    }
+    g_btns.push_back({field, [] { g_editing = true; }});
+    Button({r - 96, y, r, y + 40}, L"Connect", true, [] { g_editing = false; Find(g_edit); });
+    y += 48;
+    Text(msg.empty() ? L"The phone shows its code under “Connect to PC”." : msg, {x + 2, y, r, y + 20}, 12, MUTED, 1,
+         DWRITE_TEXT_ALIGNMENT_LEADING, false);
+}
+
 static void Paint() {
     if (!g_rt) {
         RECT rc;
@@ -1032,42 +1289,43 @@ static void Paint() {
     g_rt->Clear(D2D1::ColorF(0x000000));
 
     // ---- top bar: quick toggles, status, settings
-    float x = 12;
-    auto top = [&](const std::wstring& label, bool on, bool sup, std::function<void()> f) {
-        Chip({x, 8, x + 54, 40}, label, on, sup && conn, f, 14);
-        x += 58;
-    };
+    float x = 10;
     bool af = st["af"].boolean(true);
-    top(L"ϟ", st["torch"].boolean(), caps["torch"].boolean(), [] { Toggle("torch"); });
-    top(af ? L"AF" : L"MF", !af, caps["af"].boolean(), [] { Toggle("af", true); });
-    top(L"EIS", st["stab"].boolean(), caps["stab"].boolean(), [] { Toggle("stab"); });
-    top(L"180°", st["rot180"].boolean(), true, [] { Toggle("rot180"); });
-    top(L"⇋", st["mirror"].boolean(), true, [] { Toggle("mirror"); });
+    if (conn) {
+        auto top = [&](const std::wstring& label, bool on, bool sup, std::function<void()> f) {
+            Chip({x, 8, x + 48, 40}, label, on, sup, f, IsIcon(label) ? 16.f : 13.f);
+            x += 52;
+        };
+        top(IC_TORCH, st["torch"].boolean(), caps["torch"].boolean(), [] { Toggle("torch"); });
+        top(af ? L"AF" : L"MF", !af, caps["af"].boolean(), [] { Toggle("af", true); });
+        top(L"EIS", st["stab"].boolean(), caps["stab"].boolean(), [] { Toggle("stab"); });
+        top(IC_ROTATE, st["rot180"].boolean(), true, [] { Toggle("rot180"); });
+        top(IC_MIRROR, st["mirror"].boolean(), true, [] { Toggle("mirror"); });
+    }
 
     std::string res = st["res"].str("1920x1080");
     std::wstring hp = Wide(res.substr(res.find('x') + 1));
-    std::wstring status = conn ? L"● " + Wide(st["model"].str("Phone")) + (g_usb ? L"  ·  USB  ·  " : L"  ·  Wi-Fi  ·  ") + hp + L"p" +
+    std::wstring status = conn ? Wide(st["model"].str("Phone")) + (g_usb ? L"  ·  USB  ·  " : L"  ·  Wi-Fi  ·  ") + hp + L"p" +
                                      std::to_wstring((int)st["fps"].num(30))
-                               : L"○ Searching for phone";
-    Text(status, {x + 8, 8, W - 76, 40}, 13, conn ? GREEN : DIMC, 1, DWRITE_TEXT_ALIGNMENT_TRAILING);
-    Fill({W - 64, 10, W - 14, 38}, WHITE, g_drawer ? 0.3f : 0.15f, 14);
-    Text(L"⌄", {W - 64, 8, W - 14, 38}, 16, WHITE);
-    g_btns.push_back({{W - 64, 10, W - 14, 38}, [] { g_drawer = !g_drawer; Invalidate(); }});
+                               : L"Searching for your phone";
+    float sw = TextW(status, 13, false);
+    float sx = W - 60 - sw;
+    g_br->SetColor(D2D1::ColorF(conn ? GREEN : DIMC));
+    g_rt->FillEllipse(D2D1::Ellipse({sx - 12, 24}, 4, 4), g_br.Get());
+    Text(status, {sx, 8, W - 60, 40}, 13, conn ? WHITE : MUTED, 1, DWRITE_TEXT_ALIGNMENT_LEADING, false);
+    Chip({W - 52, 8, W - 12, 40}, IC_SETTINGS, g_drawer, true, [] { g_drawer = !g_drawer; Invalidate(); }, 16);
 
     // ---- viewfinder
-    const float SIDE = 150;
+    const float SIDE = conn ? 150.f : 0.f;
     D2D1_RECT_F vf = {0, 48, W - SIDE, H};
-    bool drew;
-    DrawPreview(vf, drew);
-    if (!drew) {
-        std::wstring msg = !g_vcamError.empty() ? g_vcamError
-                         : !conn ? L"Open openCam on your phone.\nSame Wi-Fi, or USB with USB debugging on."
-                         : st["mode"].str() == "portrait" && !st["cam"].boolean() ? L"Starting portrait mode…"
+    bool drew = false;
+    if (conn) DrawPreview(vf, drew);
+    if (!g_vcamError.empty()) Text(g_vcamError, {vf.left, vf.top, vf.right, vf.top + 28}, 13, RED, 1, DWRITE_TEXT_ALIGNMENT_CENTER, false);
+    if (!conn) ConnectPanel(vf);
+    else if (!drew) {
+        std::wstring msg = st["mode"].str() == "portrait" && !st["cam"].boolean() ? L"Starting portrait mode…"
                          : st["live"].boolean(true) ? L"Waiting for video…" : L"Paused";
-        IDWriteTextFormat* f = Font(15, false);
-        f->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
-        Text(msg, vf, 15, DIMC, 1, DWRITE_TEXT_ALIGNMENT_CENTER, false);
-        f->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        Text(msg, vf, 15, MUTED, 1, DWRITE_TEXT_ALIGNMENT_CENTER, false);
     }
 
     if (conn) {
@@ -1140,22 +1398,22 @@ static void Paint() {
             Fill({g_track.left, ty - 2, kx, ty + 2}, ACCENT, 1, 2);
             g_br->SetColor(D2D1::ColorF(WHITE));
             g_rt->FillEllipse(D2D1::Ellipse({kx, ty}, 8, 8), g_br.Get());
-            Chip({box.right - 40, box.top + 2, box.right - 6, box.bottom - 2}, L"✕", false, true, [] { g_spec.on = false; Invalidate(); }, 12);
+            Chip({box.right - 40, box.top + 2, box.right - 6, box.bottom - 2}, IC_CLOSE, false, true, [] { g_spec.on = false; Invalidate(); }, 11);
         }
 
         // ---- sidebar: modes · LIVE · flip
         float sx = W - SIDE, scx = W - SIDE / 2;
+        g_br->SetColor(D2D1::ColorF(0x0E0E10));
+        g_rt->FillRectangle({sx, 48, W, H}, g_br.Get());
         const char* modes[] = {"pro", "video", "portrait"};
         const wchar_t* names[] = {L"Pro", L"Video", L"Portrait"};
         for (int i = 0; i < 3; i++) {
             std::string m = modes[i];
             bool sup = m != "portrait" || caps["portrait"].boolean();
-            D2D1_RECT_F r = {sx + 20, 70.f + i * 44, W - 20, 106.f + i * 44};
-            Text(names[i], r, 15, m == mode ? ACCENT : WHITE, sup ? 1.f : 0.3f);
-            if (sup) g_btns.push_back({r, [m] {
+            Chip({sx + 20, 70.f + i * 46, W - 20, 108.f + i * 46}, names[i], m == mode, sup, [m] {
                 if (m != "pro" && (g_spec.key == "iso" || g_spec.key == "exp" || g_spec.key == "focus")) g_spec.on = false;
                 Set("mode", JStr(m));
-            }});
+            }, 14);
         }
         bool live = st["live"].boolean(true);
         float ly = std::max(260.f, H / 2 + 40);
@@ -1167,9 +1425,9 @@ static void Paint() {
         g_btns.push_back({{scx - 36, ly - 36, scx + 36, ly + 36}, [] { Toggle("live", true); }});
         bool canFlip = caps["facings"].a.size() > 1;
         Fill({scx - 28, H - 92, scx + 28, H - 36}, WHITE, 0.13f, 28);
-        Chip({scx - 28, H - 92, scx + 28, H - 36}, L"⟲", false, canFlip, [st] {
+        Chip({scx - 28, H - 92, scx + 28, H - 36}, IC_FLIP, false, canFlip, [st] {
             Set("facing", JStr(st["facing"].str() == "front" ? "back" : "front"));
-        }, 24);
+        }, 20);
     }
 
     // ---- settings drawer
@@ -1184,21 +1442,24 @@ static void Paint() {
             std::string r = m.substr(0, m.find('@'));
             if (std::find(resList.begin(), resList.end(), r) == resList.end()) resList.push_back(r);
         }
-        float h = 16.f + (conn ? 4 * 66 : 0) + 150; // + version line
+        float h = 12.f + (conn ? 4 : 0) * 66 + 2 * 66 + 30;
         g_drawerRect = {dx, dy, W - 12, dy + h};
-        Fill(g_drawerRect, 0x161616, 0.97f, 16);
+        Fill(g_drawerRect, SURFACE, 0.98f, 14);
+        Stroke(g_drawerRect, WHITE, 0.08f, 14);
         float cy = dy + 12;
         auto header = [&](const wchar_t* t) {
-            Text(t, {dx + 20, cy, W - 24, cy + 20}, 11, DIMC, 1, DWRITE_TEXT_ALIGNMENT_LEADING);
+            Text(t, {dx + 20, cy, W - 24, cy + 20}, 11, MUTED, 1, DWRITE_TEXT_ALIGNMENT_LEADING);
             cy += 22;
         };
         auto row = [&](const std::vector<std::wstring>& labels, std::function<bool(int)> on, std::function<bool(int)> sup,
                        std::function<void(int)> f) {
             float rx = dx + 14;
             for (int i = 0; i < (int)labels.size(); i++) {
-                float w = 18 + labels[i].size() * 8.5f;
-                Chip({rx, cy, rx + w, cy + 32}, labels[i], on(i), sup(i), [f, i] { f(i); });
-                rx += w + 4;
+                float w = TextW(labels[i], 13) + 28;
+                D2D1_RECT_F r = {rx, cy, rx + w, cy + 32};
+                if (!on(i) && sup(i)) Fill(r, WHITE, 0.05f, 16);
+                Chip(r, labels[i], on(i), sup(i), [f, i] { f(i); });
+                rx += w + 6;
             }
             cy += 44;
         };
@@ -1213,10 +1474,10 @@ static void Paint() {
             row({L"30 fps", L"60 fps"}, [&](int i) { return fpsCur == (i ? "60" : "30"); },
                 [&](int i) { return std::find(modesList.begin(), modesList.end(), res + (i ? "@60" : "@30")) != modesList.end(); },
                 [](int i) { Set("fps", i ? "60" : "30"); });
-            header(L"BITRATE");
+            header(L"BITRATE (MBPS)");
             int rates[] = {0, 8, 16, 32, 50};
             int cur = (int)st["mbps"].num();
-            row({L"Auto", L"8 Mbps", L"16 Mbps", L"32 Mbps", L"50 Mbps"}, [&](int i) { return rates[i] == cur; }, any,
+            row({L"Auto", L"8", L"16", L"32", L"50"}, [&](int i) { return rates[i] == cur; }, any,
                 [](int i) { static const int r[] = {0, 8, 16, 32, 50}; Set("mbps", JNum(r[i])); });
             header(L"PC OUTPUT");
             row({L"Mirror", L"Rotate 180°"}, [&](int i) { return st[i ? "rot180" : "mirror"].boolean(); }, any,
@@ -1224,15 +1485,27 @@ static void Paint() {
         }
         header(L"WINDOWS");
         bool autostart = AutostartOn();
+        float qx = dx + 14 + TextW(L"Start with Windows", 13) + 34;
         row({L"Start with Windows"}, [&](int) { return autostart; }, any, [autostart](int) { SetAutostart(!autostart); Invalidate(); });
-        Chip({dx + 14, cy, dx + 150, cy + 32}, L"Quit openCam", false, true, [] { PostMessageW(g_hwnd, WM_COMMAND, 4, 0); });
+        Chip({qx, cy - 44, qx + TextW(L"Quit openCam", 13) + 28, cy - 12}, L"Quit openCam", false, true,
+             [] { PostMessageW(g_hwnd, WM_COMMAND, 4, 0); }, 13, RED);
+
+        header(L"UPDATES");
         std::string upd;
+        std::wstring us;
         {
             std::lock_guard<std::mutex> l(g_m);
             upd = g_update;
+            us = g_updStatus;
         }
-        std::wstring ver = L"Version " + Wide(OPENCAM_VERSION) + (upd.empty() ? L"" : L" · " + Wide(upd) + L" installs when the camera is idle");
-        Text(ver, {dx + 14, cy + 44, g_drawerRect.right - 14, cy + 64}, 12, DIMC, 1, DWRITE_TEXT_ALIGNMENT_LEADING, false);
+        float bx = g_drawerRect.right - 14;
+        if (upd.empty()) Button({bx - 112, cy, bx, cy + 32}, L"Check now", false, [] { SetEvent(g_updWake); });
+        else Button({bx - 112, cy, bx, cy + 32}, L"Restart now", true, [] { g_updNow = true; SetEvent(g_updWake); });
+        std::wstring line = us.empty() ? L"Checks GitHub every 6 hours" : us;
+        if (!upd.empty()) line += L" · installs when the camera is idle";
+        Text(line, {dx + 20, cy - 4, bx - 120, cy + 36}, 12, WHITE, 0.85f, DWRITE_TEXT_ALIGNMENT_LEADING, false, true);
+        cy += 44;
+        Text(L"openCam " + Wide(OPENCAM_VERSION), {dx + 20, cy, bx, cy + 20}, 11, MUTED, 1, DWRITE_TEXT_ALIGNMENT_LEADING, false);
     }
 
     if (g_rt->EndDraw() == D2DERR_RECREATE_TARGET) {
@@ -1345,8 +1618,6 @@ static D2D1_POINT_2F Dip(LPARAM lp) {
     return {GET_X_LPARAM(lp) / s, GET_Y_LPARAM(lp) / s};
 }
 
-static bool In(D2D1_RECT_F r, D2D1_POINT_2F p) { return p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom; }
-
 static void Drag(D2D1_POINT_2F p) {
     float w = g_track.right - g_track.left;
     if (w > 0) SpecSet(g_spec, (p.x - g_track.left) / w);
@@ -1388,6 +1659,7 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             Drag(p);
             return 0;
         }
+        g_editing = false; // the field's own button turns it back on
         size_t first = g_drawer && In(g_drawerRect, p) ? g_drawerFirst : 0;
         for (size_t i = g_btns.size(); i-- > first;) {
             if (In(g_btns[i].r, p)) {
@@ -1400,8 +1672,40 @@ static LRESULT CALLBACK WndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         if (g_drawer && !In(g_drawerRect, p)) { g_drawer = false; InvalidateRect(h, nullptr, FALSE); }
         return 0;
     }
-    case WM_MOUSEMOVE:
-        if (g_dragging) Drag(Dip(lp));
+    case WM_MOUSEMOVE: {
+        if (g_mouse.x < 0) {
+            TRACKMOUSEEVENT t = {sizeof t, TME_LEAVE, h, 0};
+            TrackMouseEvent(&t);
+        }
+        g_mouse = Dip(lp);
+        if (g_dragging) Drag(g_mouse);
+        return 0;
+    }
+    case WM_MOUSELEAVE:
+        g_mouse = {-1, -1};
+        return 0;
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) {
+            bool hand = false;
+            for (auto& b : g_btns) hand = hand || In(b.r, g_mouse);
+            SetCursor(LoadCursor(nullptr, hand ? IDC_HAND : IDC_ARROW));
+            return TRUE;
+        }
+        break;
+    case WM_CHAR:
+        if (!g_editing) return 0;
+        if (wp == '\b') { if (!g_edit.empty()) g_edit.pop_back(); }
+        else if (wp == '\r') { g_editing = false; Find(g_edit); }
+        else if (wp == 27) g_editing = false;
+        else if (wp == 22 && OpenClipboard(h)) { // Ctrl+V
+            if (HANDLE d = GetClipboardData(CF_UNICODETEXT)) {
+                for (const wchar_t* c = (const wchar_t*)GlobalLock(d); c && *c; c++)
+                    if ((iswdigit(*c) || *c == '.') && g_edit.size() < 15) g_edit += *c;
+                GlobalUnlock(d);
+            }
+            CloseClipboard();
+        } else if ((iswdigit((wint_t)wp) || wp == '.') && g_edit.size() < 15) g_edit += (wchar_t)wp;
+        InvalidateRect(h, nullptr, FALSE);
         return 0;
     case WM_LBUTTONUP:
         if (g_dragging) { g_dragging = false; ReleaseCapture(); }

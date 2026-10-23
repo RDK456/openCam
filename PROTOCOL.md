@@ -3,7 +3,14 @@
 Phone = server, PC = client. One PC at a time; a new connection replaces the old one.
 
 - TCP `47100` on the phone. Wired: PC runs `adb forward tcp:47100 tcp:47100` and connects to `127.0.0.1:47100`.
-- UDP `47101` broadcast from the phone every 1 s while no PC is connected: ASCII `OPENCAM1|<model>|<tcpPort>`.
+- UDP `47101` on both sides, ASCII, sent from and answered to port 47101:
+  - `OPENCAM1|<model>|<tcpPort>` phone→PC: beacon. Broadcast every 1 s while no PC is connected, and sent straight
+    to a PC the user picks on the phone. A PC connects to any phone it hears from.
+  - `OPENCAM?` PC→phone: scan, sent to every address of the PC's subnets (and to one address for a pairing code).
+    The phone answers with its beacon. This gets through Windows Firewall even without an inbound rule.
+  - `OPENCAMPC?` phone→PC: search; the PC answers `OPENCAMPC|<computer name>`.
+- Pairing code: the phone's IPv4 address & 0xFFFF as 5 digits. The PC tries that host part on each of its own
+  subnets' /16.
 
 ## Framing (TCP, both directions)
 
