@@ -792,6 +792,8 @@ static int CallDll(const std::wstring& dll, const char* fn) {
     return SUCCEEDED(hr) ? 0 : 2;
 }
 
+#define FW_RULE L"openCam-UDP-47101"
+
 static std::wstring Netsh(const std::wstring& args) {
     wchar_t p[MAX_PATH];
     ExpandEnvironmentStringsW(L"%SystemRoot%\\System32\\netsh.exe", p, MAX_PATH);
@@ -804,13 +806,16 @@ static int Install() {
     std::wstring dst = InstallDir() + L"\\opencam_vcam.dll";
     CreateDirectoryW(InstallDir().c_str(), nullptr);
     CopyFileW((ExeDir() + L"\\opencam_vcam.dll").c_str(), dst.c_str(), FALSE); // may fail if in use; keep the old one
+    // Port-only, so it keeps working when the exe moves; 1.1.0 made a per-program rule named "openCam".
     Run(Netsh(L"delete rule name=openCam"));
-    Run(Netsh(L"add rule name=openCam dir=in action=allow protocol=UDP localport=47101 profile=any program=\"" + ExePath() + L"\""));
+    Run(Netsh(L"delete rule name=" FW_RULE));
+    Run(Netsh(L"add rule name=" FW_RULE L" dir=in action=allow protocol=UDP localport=47101 profile=any"));
     return CallDll(dst, "DllRegisterServer");
 }
 
 static int Uninstall() {
     Run(Netsh(L"delete rule name=openCam"));
+    Run(Netsh(L"delete rule name=" FW_RULE));
     std::wstring dst = InstallDir() + L"\\opencam_vcam.dll";
     int r = CallDll(dst, "DllUnregisterServer");
     DeleteFileW(dst.c_str());
@@ -825,7 +830,7 @@ static bool NeedsInstall() {
     if (_wcsicmp(v, (InstallDir() + L"\\opencam_vcam.dll").c_str())) return true;
     std::string local = ReadAll(ExeDir() + L"\\opencam_vcam.dll");
     if (!local.empty() && local != ReadAll(v)) return true; // a different build sits next to the exe
-    return Run(Netsh(L"show rule name=openCam")) != 0;
+    return Run(Netsh(L"show rule name=" FW_RULE)) != 0;
 }
 
 static void EnsureInstalled() {

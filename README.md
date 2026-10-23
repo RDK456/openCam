@@ -57,7 +57,7 @@ connect on their own. The PC remembers the last phone and tries it first. If tha
   shown on the phone while no PC is connected) or its IP address.
 - **Phone:** tap **Search** under *PCs on this network* and tap your PC.
 
-The one-time UAC step also adds a Windows Firewall rule for UDP 47101 (openCam only) so phone beacons get through.
+The one-time UAC step also adds a Windows Firewall rule for inbound UDP port 47101 only, so phone beacons and searches get through.
 Networks with client isolation (some guest/public Wi-Fi) block devices from seeing each other; use USB there.
 
 ## Controls (phone and PC)
