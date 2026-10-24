@@ -6,9 +6,14 @@ Use an Android phone as a webcam for every Windows app (Zoom, Teams, Chrome, OBS
 No resolution cap, no watermark. Both sides show the same camera controls and stay in sync.
 
 <p align="center">
+  <img src="docs/pc-live.png" width="72%" alt="openCam on Windows showing the phone's live feed with camera controls">
+  <img src="docs/phone.png" width="22%" alt="openCam on Android with zoom, focus, mode and LIVE controls">
+</p>
+<p align="center">
   <img src="docs/pc-connect.png" width="49%" alt="openCam on Windows finding a phone on the network">
   <img src="docs/pc-settings.png" width="49%" alt="openCam settings panel with start-with-Windows and updates">
 </p>
+<p align="center"><sub>Camera feed blurred in the screenshots.</sub></p>
 
 ## Features
 
