@@ -5,6 +5,20 @@
 Use an Android phone as a webcam for every Windows app (Zoom, Teams, Chrome, OBS…), over USB or Wi-Fi.
 No resolution cap, no watermark. Both sides show the same camera controls and stay in sync.
 
+<p align="center">
+  <img src="docs/pc-connect.png" width="49%" alt="openCam on Windows finding a phone on the network">
+  <img src="docs/pc-settings.png" width="49%" alt="openCam settings panel with start-with-Windows and updates">
+</p>
+
+## Features
+
+- **Every Windows app sees it.** A real Windows 11 virtual camera named *openCam*. No OBS plugin needed.
+- **USB or Wi-Fi.** USB via `adb forward`. On Wi-Fi the phone and PC find each other, or pair with a 5-digit code.
+- **Up to 4K, 30/60 fps.** Hardware H.264 encode on the phone. No watermark, no time limit.
+- **Full camera control from either side.** Zoom, flip, torch, focus, exposure, stabilisation, Pro (ISO, shutter, white balance), Portrait blur.
+- **Battery friendly.** The phone camera runs only while something is watching.
+- **Hands-off.** Starts with Windows in the tray, reconnects by itself, and updates itself from GitHub Releases.
+
 ```
 android/   Kotlin app: Camera2 → hardware H.264 → TCP server (foreground service)
 windows/   openCam.exe (tray app: connect, decode, UI) + opencam_vcam.dll (virtual camera)
